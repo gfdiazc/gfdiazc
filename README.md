@@ -1,0 +1,4 @@
+- 👋 Hi, I’m @gfdiazc
+- 👀 I’m interested in tecnology.
+- 🌱 I’m currently learning AI.
+- 💞️ I’m looking to collaborate on Data Science

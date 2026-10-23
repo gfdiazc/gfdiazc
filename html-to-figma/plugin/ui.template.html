@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    --bg: var(--figma-color-bg, #fff);
+    --bg2: var(--figma-color-bg-secondary, #f5f5f5);
+    --text: var(--figma-color-text, #1e1e1e);
+    --muted: var(--figma-color-text-secondary, #6b6b6b);
+    --border: var(--figma-color-border, #e2e2e2);
+    --accent: var(--figma-color-bg-brand, #0d99ff);
+    --on-accent: var(--figma-color-text-onbrand, #fff);
+    --danger: var(--figma-color-text-danger, #d92f2f);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 12px/1.45 Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  main { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 10px; height: 100vh; }
+  .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--border); }
+  .tabs button { flex: 1; border: 0; background: none; color: var(--muted); padding: 8px 0; font: inherit; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  section { display: none; flex-direction: column; gap: 8px; flex: 1; min-height: 0; }
+  section.active { display: flex; }
+  label { color: var(--muted); font-size: 11px; display: flex; flex-direction: column; gap: 4px; }
+  textarea, input { font: 11px/1.4 ui-monospace, Menlo, monospace; color: var(--text); background: var(--bg2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; width: 100%; }
+  textarea { flex: 1; min-height: 120px; resize: none; }
+  input[type='number'] { font-family: inherit; }
+  .grow { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .hint { color: var(--muted); font-size: 11px; margin: 0; }
+  code { background: var(--bg2); padding: 1px 4px; border-radius: 4px; }
+  .primary { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 6px; padding: 10px; font: inherit; font-weight: 600; cursor: pointer; }
+  .primary:disabled { opacity: 0.5; cursor: default; }
+  #status { min-height: 18px; color: var(--muted); white-space: pre-wrap; max-height: 110px; overflow: auto; }
+  #status.error { color: var(--danger); }
+  #stage { position: fixed; left: -30000px; top: 0; border: 0; background: #fff; }
+</style>
+</head>
+<body>
+<main>
+  <div class="tabs" role="tablist">
+    <button class="active" data-tab="html">HTML</button>
+    <button data-tab="url">URL</button>
+    <button data-tab="json">JSON (CLI)</button>
+  </div>
+
+  <section id="tab-html" class="active">
+    <label class="grow">Pega tu HTML (puede incluir &lt;style&gt; y scripts como Tailwind)
+      <textarea id="html" spellcheck="false" placeholder="<html>&#10;  <body>…</body>&#10;</html>"></textarea>
+    </label>
+    <label>URL base para imágenes y CSS relativos (opcional)
+      <input id="base" placeholder="https://misitio.com/" />
+    </label>
+  </section>
+
+  <section id="tab-url">
+    <label>Dirección de la página
+      <input id="url" placeholder="https://…" />
+    </label>
+    <p class="hint">Solo funciona con sitios que permiten leerse desde otro dominio (CORS). Para cualquier sitio usa la CLI y luego la pestaña JSON:<br /><code>node src/cli.mjs https://sitio.com -o sitio.json</code></p>
+  </section>
+
+  <section id="tab-json">
+    <label>Archivo generado por la CLI
+      <input id="file" type="file" accept=".json,application/json" />
+    </label>
+    <label class="grow">…o pega el JSON
+      <textarea id="json" spellcheck="false"></textarea>
+    </label>
+  </section>
+
+  <div class="row" id="viewport-row">
+    <label>Ancho (px)<input id="width" type="number" value="1440" min="200" max="4000" /></label>
+    <label>Alto de pantalla (px)<input id="height" type="number" value="900" min="200" max="4000" /></label>
+  </div>
+  <button id="go" class="primary">Convertir a Figma</button>
+  <div id="status"></div>
+</main>
+<iframe id="stage" title="render"></iframe>
+
+<script>
+/*__CAPTURE_JS__*/
+</script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var tab = 'html';
+  var statusEl = $('status');
+  var go = $('go');
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'error' : '';
+  }
+
+  document.querySelectorAll('.tabs button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      tab = b.dataset.tab;
+      document.querySelectorAll('.tabs button').forEach(function (x) { x.classList.toggle('active', x === b); });
+      document.querySelectorAll('section').forEach(function (s) { s.classList.toggle('active', s.id === 'tab-' + tab); });
+      $('viewport-row').style.display = tab === 'json' ? 'none' : '';
+    });
+  });
+
+  $('file').addEventListener('change', function (e) {
+    var f = e.target.files[0];
+    if (!f) return;
+    f.text().then(function (t) { $('json').value = t; setStatus('Archivo cargado: ' + f.name); });
+  });
+
+  function withBase(html, base) {
+    if (!base || /<base\s/i.test(html)) return html;
+    var tag = '<base href="' + base.replace(/"/g, '&quot;') + '">';
+    if (/<head[^>]*>/i.test(html)) return html.replace(/<head[^>]*>/i, function (m) { return m + tag; });
+    return tag + html;
+  }
+
+  function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function waitForAssets(doc) {
+    var imgs = Array.prototype.filter.call(doc.images, function (i) { return !i.complete; });
+    var pending = imgs.map(function (img) {
+      return new Promise(function (r) { img.addEventListener('load', r); img.addEventListener('error', r); });
+    });
+    var fonts = doc.fonts ? doc.fonts.ready : Promise.resolve();
+    return Promise.race([Promise.all(pending.concat([fonts])), delay(10000)]);
+  }
+
+  function renderAndCapture(html, base, width, height) {
+    var stage = $('stage');
+    stage.style.width = width + 'px';
+    stage.style.height = height + 'px';
+    return new Promise(function (resolve) {
+      stage.onload = resolve;
+      stage.srcdoc = withBase(html, base);
+    })
+      .then(function () { return delay(400); }) // let client-side scripts (e.g. Tailwind CDN) apply styles
+      .then(function () { return waitForAssets(stage.contentDocument); })
+      .then(function () {
+        var result = HtmlToFigma.capture({ document: stage.contentDocument });
+        setStatus('Descargando imágenes…');
+        return HtmlToFigma.resolveImagesInBrowser(result);
+      });
+  }
+
+  function send(result) {
+    var failed = Object.keys(result.images || {}).filter(function (k) { return result.images[k].error; }).length;
+    var s = result.stats || {};
+    setStatus('Creando capas en Figma… (' + (s.frames || 0) + ' frames, ' + (s.texts || 0) + ' textos' + (failed ? ', ' + failed + ' imágenes no disponibles' : '') + ')');
+    parent.postMessage({ pluginMessage: { type: 'import', data: result } }, '*');
+  }
+
+  function fail(e) {
+    go.disabled = false;
+    setStatus((e && e.message) || String(e), true);
+  }
+
+  go.addEventListener('click', function () {
+    var width = Math.max(200, Number($('width').value) || 1440);
+    var height = Math.max(200, Number($('height').value) || 900);
+    go.disabled = true;
+    try {
+      if (tab === 'html') {
+        var html = $('html').value.trim();
+        if (!html) throw new Error('Pega algo de HTML primero.');
+        setStatus('Renderizando HTML…');
+        renderAndCapture(html, $('base').value.trim(), width, height).then(send, fail);
+      } else if (tab === 'url') {
+        var url = $('url').value.trim();
+        if (!/^https?:\/\//i.test(url)) throw new Error('Escribe una URL que empiece con https://');
+        setStatus('Descargando página…');
+        fetch(url)
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.text();
+          })
+          .catch(function () {
+            throw new Error('Este sitio no permite leerse desde el plugin (CORS).\nUsa la CLI: node src/cli.mjs ' + url + ' -o captura.json\ny luego importa el archivo en la pestaña JSON.');
+          })
+          .then(function (html) {
+            setStatus('Renderizando página…');
+            return renderAndCapture(html, url, width, height);
+          })
+          .then(send, fail);
+      } else {
+        var data = JSON.parse($('json').value || 'null');
+        if (!data || !data.root) throw new Error('Ese JSON no parece una captura de html-to-figma.');
+        setStatus('Preparando imágenes…');
+        HtmlToFigma.resolveImagesInBrowser(data).then(send, fail);
+      }
+    } catch (e) {
+      fail(e);
+    }
+  });
+
+  window.onmessage = function (event) {
+    var msg = event.data && event.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'progress') setStatus('Creando capas… ' + msg.count + ' / ' + msg.total);
+    if (msg.type === 'error') fail(new Error(msg.message));
+    if (msg.type === 'done') {
+      go.disabled = false;
+      var text = 'Listo: ' + msg.count + ' capas creadas.';
+      if (msg.fonts && msg.fonts.length) text += '\nFuentes sustituidas: ' + msg.fonts.join(', ');
+      if (msg.warnings && msg.warnings.length) text += '\n' + msg.warnings.join('\n');
+      setStatus(text);
+    }
+  };
+})();
+</script>
+</body>
+</html>

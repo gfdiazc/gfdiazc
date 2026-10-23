@@ -1,0 +1,814 @@
+/*
+ * html-to-figma capture.
+ *
+ * Runs inside a browser page. Walks the rendered DOM, reads computed styles and
+ * layout boxes, and returns a JSON tree whose paints/effects are already shaped
+ * like Figma's Plugin API objects. Shared by the CLI (via Playwright) and the
+ * Figma plugin UI (via a hidden iframe).
+ *
+ * Exposes `globalThis.HtmlToFigma` with:
+ *   capture(options)                -> capture result (images referenced by id)
+ *   resolveImagesInBrowser(result)  -> fetches images and embeds them as base64
+ *   convertDataUrl(dataUrl)         -> { base64, mime } in a Figma-supported format
+ */
+(function (global) {
+  'use strict';
+
+  var VERSION = 1;
+  var SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'META', 'LINK', 'TITLE', 'BASE', 'BR', 'WBR']);
+  var REPLACED_TAGS = new Set(['IMG', 'VIDEO', 'CANVAS', 'IFRAME', 'INPUT', 'TEXTAREA', 'SELECT', 'OBJECT', 'EMBED']);
+  var TEXT_INPUT_TYPES = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'time', 'datetime-local', 'month', 'week', '']);
+  var FIGMA_IMAGE_MIME = new Set(['image/png', 'image/jpeg', 'image/gif']);
+  var MAX_LINE_SPLIT_CHARS = 4000;
+
+  // ---------- small parsers ----------
+
+  function px(value) {
+    var n = parseFloat(value);
+    return isFinite(n) ? n : 0;
+  }
+
+  function round(n) {
+    return Math.round(n * 100) / 100;
+  }
+
+  // Split on a separator, ignoring separators inside parentheses or quotes.
+  function splitTopLevel(str, sep) {
+    var out = [];
+    var depth = 0;
+    var quote = null;
+    var cur = '';
+    for (var i = 0; i < str.length; i++) {
+      var ch = str[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+      } else if (ch === '"' || ch === "'") {
+        quote = ch;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
+        depth--;
+      } else if (depth === 0 && (sep === ' ' ? /\s/.test(ch) : ch === sep)) {
+        if (cur.trim()) out.push(cur.trim());
+        cur = '';
+        continue;
+      }
+      cur += ch;
+    }
+    if (cur.trim()) out.push(cur.trim());
+    return out;
+  }
+
+  var colorCtx = null;
+  function parseColor(str) {
+    if (!str) return null;
+    str = String(str).trim();
+    if (!str || str === 'transparent' || str === 'none') return null;
+    var m = str.match(/^rgba?\(([^)]+)\)$/i);
+    if (m) {
+      var parts = m[1].split(/[\s,/]+/).filter(Boolean);
+      var ch = function (p) { return p.slice(-1) === '%' ? parseFloat(p) * 2.55 : parseFloat(p); };
+      var a = parts.length > 3 ? (parts[3].slice(-1) === '%' ? parseFloat(parts[3]) / 100 : parseFloat(parts[3])) : 1;
+      if (!(a > 0)) return null;
+      return { r: clamp01(ch(parts[0]) / 255), g: clamp01(ch(parts[1]) / 255), b: clamp01(ch(parts[2]) / 255), a: clamp01(a) };
+    }
+    m = str.match(/^color\(srgb\s+([^)]+)\)$/i);
+    if (m) {
+      var p = m[1].split(/[\s/]+/).filter(Boolean).map(parseFloat);
+      var alpha = p.length > 3 ? p[3] : 1;
+      if (!(alpha > 0)) return null;
+      return { r: clamp01(p[0]), g: clamp01(p[1]), b: clamp01(p[2]), a: clamp01(alpha) };
+    }
+    // Anything else (oklch, lab, named colors...): let a canvas normalize it.
+    if (typeof document === 'undefined') return null;
+    if (!colorCtx) {
+      var c = document.createElement('canvas');
+      c.width = c.height = 1;
+      colorCtx = c.getContext('2d', { willReadFrequently: true });
+    }
+    colorCtx.clearRect(0, 0, 1, 1);
+    colorCtx.fillStyle = 'rgba(0,0,0,0)';
+    colorCtx.fillStyle = str;
+    colorCtx.fillRect(0, 0, 1, 1);
+    var d = colorCtx.getImageData(0, 0, 1, 1).data;
+    if (d[3] === 0) return null;
+    return { r: d[0] / 255, g: d[1] / 255, b: d[2] / 255, a: d[3] / 255 };
+  }
+
+  function clamp01(n) {
+    return Math.max(0, Math.min(1, isFinite(n) ? n : 0));
+  }
+
+  function solidPaint(color) {
+    return { type: 'SOLID', color: { r: color.r, g: color.g, b: color.b }, opacity: color.a };
+  }
+
+  // ---------- gradients ----------
+
+  function parseAngle(arg, w, h) {
+    arg = arg.trim().toLowerCase();
+    var m = arg.match(/^(-?[\d.]+)(deg|grad|rad|turn)$/);
+    if (m) {
+      var v = parseFloat(m[1]);
+      if (m[2] === 'grad') return v * 0.9;
+      if (m[2] === 'rad') return (v * 180) / Math.PI;
+      if (m[2] === 'turn') return v * 360;
+      return v;
+    }
+    if (arg.indexOf('to ') === 0) {
+      var parts = arg.slice(3).trim().split(/\s+/);
+      var has = function (k) { return parts.indexOf(k) !== -1; };
+      var corner = (Math.atan2(h, w) * 180) / Math.PI;
+      if (has('top') && has('right')) return corner;
+      if (has('bottom') && has('right')) return 180 - corner;
+      if (has('bottom') && has('left')) return 180 + corner;
+      if (has('top') && has('left')) return 360 - corner;
+      if (has('top')) return 0;
+      if (has('right')) return 90;
+      if (has('left')) return 270;
+      return 180;
+    }
+    return null;
+  }
+
+  // Figma's gradientTransform maps node space (0..1) to gradient space,
+  // where the gradient runs from (0, 0.5) to (1, 0.5).
+  function linearGradientTransform(deg, w, h) {
+    var a = (deg * Math.PI) / 180;
+    var dx = Math.sin(a);
+    var dy = -Math.cos(a);
+    var len = Math.abs(w * dx) + Math.abs(h * dy);
+    var p0 = { x: (w / 2 - (dx * len) / 2) / w, y: (h / 2 - (dy * len) / 2) / h };
+    var p1 = { x: (w / 2 + (dx * len) / 2) / w, y: (h / 2 + (dy * len) / 2) / h };
+    var vx = p1.x - p0.x;
+    var vy = p1.y - p0.y;
+    var l2 = vx * vx + vy * vy || 1;
+    return {
+      length: len,
+      transform: [
+        [vx / l2, vy / l2, -(p0.x * vx + p0.y * vy) / l2],
+        [-vy / l2, vx / l2, 0.5 - (p0.x * -vy + p0.y * vx) / l2],
+      ],
+    };
+  }
+
+  function parseStops(args, lengthPx) {
+    var stops = [];
+    args.forEach(function (arg) {
+      var colorPart;
+      var rest;
+      var close = arg.lastIndexOf(')');
+      if (close !== -1 && /^[a-z-]+\(/i.test(arg)) {
+        colorPart = arg.slice(0, close + 1);
+        rest = arg.slice(close + 1).trim();
+      } else {
+        var tokens = arg.split(/\s+/);
+        colorPart = tokens.shift();
+        rest = tokens.join(' ');
+      }
+      var color = parseColor(colorPart);
+      if (!color) {
+        // transparent stops still matter for gradients
+        if (/^transparent$/i.test(colorPart)) color = { r: 0, g: 0, b: 0, a: 0 };
+        else return; // color hint or unsupported value
+      }
+      var positions = rest ? rest.split(/\s+/) : [];
+      var toPos = function (p) {
+        if (/%$/.test(p)) return parseFloat(p) / 100;
+        if (/px$/.test(p)) return lengthPx ? parseFloat(p) / lengthPx : null;
+        return null;
+      };
+      if (positions.length === 0) stops.push({ color: color, position: null });
+      positions.forEach(function (p) { stops.push({ color: color, position: toPos(p) }); });
+    });
+    if (!stops.length) return [];
+    if (stops[0].position == null) stops[0].position = 0;
+    if (stops[stops.length - 1].position == null) stops[stops.length - 1].position = 1;
+    // Fill in missing positions evenly between known ones.
+    for (var i = 1; i < stops.length; i++) {
+      if (stops[i].position != null) continue;
+      var j = i;
+      while (stops[j].position == null) j++;
+      var start = stops[i - 1].position;
+      var end = stops[j].position;
+      for (var k = i; k < j; k++) stops[k].position = start + ((end - start) * (k - i + 1)) / (j - i + 1);
+    }
+    var last = 0;
+    return stops.map(function (s) {
+      last = Math.max(last, clamp01(s.position));
+      return { position: last, color: { r: s.color.r, g: s.color.g, b: s.color.b, a: s.color.a } };
+    });
+  }
+
+  function parseGradient(layer, w, h) {
+    var m = layer.match(/^(repeating-)?(linear|radial)-gradient\((.*)\)$/i);
+    if (!m) return null;
+    var args = splitTopLevel(m[3], ',');
+    if (m[2].toLowerCase() === 'linear') {
+      var deg = parseAngle(args[0], w, h);
+      if (deg != null) args = args.slice(1);
+      else deg = 180;
+      var g = linearGradientTransform(deg, w, h);
+      var stops = parseStops(args, g.length);
+      if (stops.length < 2) return null;
+      return { type: 'GRADIENT_LINEAR', gradientTransform: g.transform, gradientStops: stops };
+    }
+    // radial: approximate as a centered ellipse reaching the corners
+    if (args.length && !parseColor(splitTopLevel(args[0], ' ')[0]) && !/^transparent/i.test(args[0])) args = args.slice(1);
+    var rstops = parseStops(args, Math.max(w, h) / 2);
+    if (rstops.length < 2) return null;
+    var s = Math.SQRT1_2;
+    return {
+      type: 'GRADIENT_RADIAL',
+      gradientTransform: [[s, 0, 0.5 - 0.5 * s], [0, s, 0.5 - 0.5 * s]],
+      gradientStops: rstops,
+    };
+  }
+
+  // ---------- effects ----------
+
+  function parseShadows(str) {
+    if (!str || str === 'none') return [];
+    return splitTopLevel(str, ',')
+      .map(function (part) {
+        var inset = false;
+        var color = null;
+        var lens = [];
+        splitTopLevel(part, ' ').forEach(function (t) {
+          if (t === 'inset') inset = true;
+          else if (/^-?[\d.]+(px)?$/.test(t)) lens.push(parseFloat(t));
+          else color = parseColor(t);
+        });
+        if (!color || lens.length < 2) return null;
+        return {
+          type: inset ? 'INNER_SHADOW' : 'DROP_SHADOW',
+          color: { r: color.r, g: color.g, b: color.b, a: color.a },
+          offset: { x: lens[0], y: lens[1] },
+          radius: Math.max(0, lens[2] || 0),
+          spread: lens[3] || 0,
+          visible: true,
+          blendMode: 'NORMAL',
+        };
+      })
+      .filter(Boolean)
+      .reverse();
+  }
+
+  function parseBlur(str) {
+    var m = str && str.match(/blur\(([\d.]+)px\)/);
+    return m ? parseFloat(m[1]) : 0;
+  }
+
+  // ---------- capture ----------
+
+  function Capturer(doc, options) {
+    this.doc = doc;
+    this.win = doc.defaultView;
+    this.options = options || {};
+    this.sx = this.win.scrollX;
+    this.sy = this.win.scrollY;
+    this.images = {};
+    this.imageIds = new Map();
+    this.stats = { frames: 0, texts: 0, images: 0, svgs: 0 };
+  }
+
+  Capturer.prototype.box = function (rect) {
+    return { x: round(rect.left + this.sx), y: round(rect.top + this.sy), width: round(rect.width), height: round(rect.height) };
+  };
+
+  Capturer.prototype.registerImage = function (url) {
+    if (!url) return null;
+    if (this.imageIds.has(url)) return this.imageIds.get(url);
+    var id = 'img' + (this.imageIds.size + 1);
+    this.imageIds.set(url, id);
+    this.images[id] = { url: url };
+    this.stats.images++;
+    return id;
+  };
+
+  Capturer.prototype.nameFor = function (el) {
+    var n = el.tagName.toLowerCase();
+    if (el.id) n += '#' + el.id;
+    else {
+      var cls = typeof el.className === 'string' ? el.className : el.getAttribute('class') || '';
+      cls = cls.trim();
+      if (cls) n += '.' + cls.split(/\s+/).slice(0, 2).join('.');
+    }
+    var label = el.getAttribute('aria-label') || el.getAttribute('alt');
+    if (label) n = label.slice(0, 40) + ' (' + n + ')';
+    return n;
+  };
+
+  Capturer.prototype.backgroundPaints = function (cs, w, h) {
+    var fills = [];
+    var bg = parseColor(cs.backgroundColor);
+    if (bg) fills.push(solidPaint(bg));
+    var image = cs.backgroundImage;
+    if (image && image !== 'none') {
+      var self = this;
+      var sizes = splitTopLevel(cs.backgroundSize || '', ',');
+      var repeats = splitTopLevel(cs.backgroundRepeat || '', ',');
+      var layers = splitTopLevel(image, ',').map(function (layer, i) {
+        var url = layer.match(/^url\((['"]?)(.*)\1\)$/);
+        if (url) {
+          var size = sizes[i] || sizes[0] || 'auto';
+          var repeat = repeats[i] || repeats[0] || 'repeat';
+          var mode = 'FILL';
+          if (size === 'contain') mode = 'FIT';
+          else if (size !== 'cover' && repeat.indexOf('no-repeat') === -1) mode = 'TILE';
+          return { type: 'IMAGE', scaleMode: mode, imageRef: self.registerImage(url[2]) };
+        }
+        return parseGradient(layer, w, h);
+      });
+      // CSS lists the top layer first; Figma lists it last.
+      layers.reverse().forEach(function (p) { if (p) fills.push(p); });
+    }
+    return fills;
+  };
+
+  Capturer.prototype.frameStyles = function (el, cs, box, flags) {
+    var out = {};
+    out.fills = flags.suppressBackground ? [] : this.backgroundPaints(cs, box.width, box.height);
+
+    var sides = ['Top', 'Right', 'Bottom', 'Left'].map(function (s) {
+      var style = cs['border' + s + 'Style'];
+      var width = style === 'none' || style === 'hidden' ? 0 : px(cs['border' + s + 'Width']);
+      return { width: width, color: parseColor(cs['border' + s + 'Color']), style: style };
+    });
+    var drawn = sides.filter(function (s) { return s.width > 0 && s.color; });
+    if (drawn.length) {
+      // Figma has one stroke color per layer: use the most common border color as the
+      // stroke and draw differently colored sides as separate bars.
+      var key = function (c) { return [c.r, c.g, c.b, c.a].join(','); };
+      var votes = {};
+      drawn.forEach(function (s) { votes[key(s.color)] = (votes[key(s.color)] || 0) + 1; });
+      var main = drawn.slice().sort(function (a, b) { return votes[key(b.color)] - votes[key(a.color)]; })[0];
+      var w = sides.map(function (s) { return s.width > 0 && s.color && key(s.color) === key(main.color) ? s.width : 0; });
+      out.strokes = [solidPaint(main.color)];
+      out.strokeWeights = { top: w[0], right: w[1], bottom: w[2], left: w[3] };
+      if (main.style === 'dashed' || main.style === 'dotted') out.dashed = main.style;
+      out.borderBars = sides
+        .map(function (s, i) { return { side: i, width: s.width, color: s.color }; })
+        .filter(function (s) { return s.width > 0 && s.color && key(s.color) !== key(main.color); });
+    }
+
+    var maxR = Math.min(box.width, box.height) / 2;
+    var radius = function (v) {
+      var first = String(v || '0').split(/\s+/)[0];
+      var r = /%$/.test(first) ? (parseFloat(first) / 100) * box.width : px(first);
+      return round(Math.max(0, Math.min(r, maxR)));
+    };
+    var cr = {
+      tl: radius(cs.borderTopLeftRadius),
+      tr: radius(cs.borderTopRightRadius),
+      br: radius(cs.borderBottomRightRadius),
+      bl: radius(cs.borderBottomLeftRadius),
+    };
+    if (cr.tl || cr.tr || cr.br || cr.bl) out.cornerRadius = cr;
+
+    var effects = parseShadows(cs.boxShadow);
+    var blur = parseBlur(cs.filter);
+    if (blur) effects.push({ type: 'LAYER_BLUR', radius: blur, visible: true });
+    var backdrop = parseBlur(cs.backdropFilter || cs.webkitBackdropFilter);
+    if (backdrop) effects.push({ type: 'BACKGROUND_BLUR', radius: backdrop, visible: true });
+    if (effects.length) out.effects = effects;
+    return out;
+  };
+
+  Capturer.prototype.textStyle = function (cs) {
+    var color = parseColor(cs.webkitTextFillColor) || parseColor(cs.color);
+    var align = cs.textAlign;
+    if (align === 'start') align = cs.direction === 'rtl' ? 'right' : 'left';
+    if (align === 'end') align = cs.direction === 'rtl' ? 'left' : 'right';
+    var deco = cs.textDecorationLine || cs.textDecoration || '';
+    return {
+      fontFamily: cs.fontFamily,
+      fontSize: px(cs.fontSize),
+      fontWeight: parseInt(cs.fontWeight, 10) || 400,
+      italic: cs.fontStyle === 'italic' || cs.fontStyle.indexOf('oblique') === 0,
+      color: color,
+      lineHeight: cs.lineHeight === 'normal' ? null : px(cs.lineHeight),
+      letterSpacing: cs.letterSpacing === 'normal' ? 0 : px(cs.letterSpacing),
+      textAlign: align,
+      textDecoration: deco.indexOf('underline') !== -1 ? 'UNDERLINE' : deco.indexOf('line-through') !== -1 ? 'STRIKETHROUGH' : 'NONE',
+      textCase: { uppercase: 'UPPER', lowercase: 'LOWER', capitalize: 'TITLE' }[cs.textTransform] || 'ORIGINAL',
+    };
+  };
+
+  function normalizeText(s, whiteSpace) {
+    if (/^(pre|pre-wrap|break-spaces)$/.test(whiteSpace)) return s.replace(/^\n/, '').replace(/\n$/, '');
+    if (whiteSpace === 'pre-line') return s.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').trim();
+    return s.replace(/\s+/g, ' ').trim();
+  }
+
+  Capturer.prototype.textNodes = function (node, cs) {
+    var raw = node.nodeValue;
+    if (!raw) return [];
+    var preserve = /^(pre|pre-wrap|break-spaces|pre-line)$/.test(cs.whiteSpace);
+    if (!preserve && !raw.trim()) return [];
+    var range = this.doc.createRange();
+    range.selectNodeContents(node);
+    var rects = Array.prototype.filter.call(range.getClientRects(), function (r) { return r.width > 0 && r.height > 0; });
+    if (!rects.length) return [];
+    var style = this.textStyle(cs);
+    var self = this;
+
+    var lineTops = [];
+    rects.forEach(function (r) {
+      if (!lineTops.some(function (t) { return Math.abs(t - r.top) < r.height / 2; })) lineTops.push(r.top);
+    });
+    var bounds = range.getBoundingClientRect();
+    var siblingsHaveContent = Array.prototype.some.call(node.parentNode.childNodes, function (c) {
+      return c !== node && (c.nodeType === 1 || (c.nodeType === 3 && c.nodeValue.trim()));
+    });
+    var mixedInline = lineTops.length > 1 && (siblingsHaveContent || Math.abs(rects[0].left - bounds.left) > 1);
+
+    var make = function (text, left, top, right, bottom, lines) {
+      text = normalizeText(text, cs.whiteSpace);
+      if (!text) return null;
+      self.stats.texts++;
+      return {
+        type: 'TEXT',
+        name: text.slice(0, 40),
+        x: round(left + self.sx),
+        y: round(top + self.sy),
+        width: round(right - left),
+        height: round(bottom - top),
+        characters: text,
+        lines: lines,
+        style: style,
+      };
+    };
+
+    if (mixedInline && raw.length <= MAX_LINE_SPLIT_CHARS) {
+      // Text that starts mid-line next to other inline content: split per rendered line
+      // so each piece keeps its real position.
+      var lines = [];
+      var cur = null;
+      for (var i = 0; i < raw.length; i++) {
+        range.setStart(node, i);
+        range.setEnd(node, i + 1);
+        var r = range.getBoundingClientRect();
+        // Whitespace never starts a line or widens it, so pieces start at their first glyph.
+        if ((r.width === 0 && r.height === 0) || /\s/.test(raw[i])) {
+          if (cur) cur.end = i + 1;
+          continue;
+        }
+        if (!cur || r.top > cur.top + cur.height / 2) {
+          cur = { start: i, end: i + 1, top: r.top, height: r.height, left: r.left, right: r.right, bottom: r.bottom };
+          lines.push(cur);
+        } else {
+          cur.end = i + 1;
+          cur.left = Math.min(cur.left, r.left);
+          cur.right = Math.max(cur.right, r.right);
+          cur.bottom = Math.max(cur.bottom, r.bottom);
+        }
+      }
+      return lines
+        .map(function (l) { return make(raw.slice(l.start, l.end), l.left, l.top, l.right, l.bottom, 1); })
+        .filter(Boolean);
+    }
+    if (!preserve) {
+      // Measure only the visible glyphs, not leading/trailing spaces.
+      var startIdx = raw.search(/\S/);
+      var endIdx = raw.length - (raw.match(/\s*$/)[0].length);
+      range.setStart(node, startIdx);
+      range.setEnd(node, endIdx);
+      bounds = range.getBoundingClientRect();
+    }
+    var single = make(raw, bounds.left, bounds.top, bounds.right, bounds.bottom, preserve ? Math.max(lineTops.length, raw.split('\n').length) : lineTops.length);
+    return single ? [single] : [];
+  };
+
+  Capturer.prototype.svgNode = function (el, box) {
+    var win = this.win;
+    var clone = el.cloneNode(true);
+    var src = [el].concat(Array.prototype.slice.call(el.querySelectorAll('*')));
+    var dst = [clone].concat(Array.prototype.slice.call(clone.querySelectorAll('*')));
+    var props = ['fill', 'stroke', 'stroke-width', 'fill-opacity', 'stroke-opacity', 'opacity', 'stroke-linecap', 'stroke-linejoin', 'stroke-dasharray', 'fill-rule'];
+    src.forEach(function (s, i) {
+      var d = dst[i];
+      if (!d || !d.setAttribute || /^(defs|style|title|desc)$/i.test(s.tagName)) return;
+      var c = win.getComputedStyle(s);
+      props.forEach(function (p) {
+        var v = c.getPropertyValue(p);
+        if (v && v !== 'normal') d.setAttribute(p, v.replace(/url\("(#[^"]+)"\)/, 'url($1)'));
+      });
+    });
+    // Inline <use href="#id"> targets that live outside this <svg> (icon sprites).
+    var doc = this.doc;
+    Array.prototype.forEach.call(clone.querySelectorAll('use'), function (u) {
+      var href = u.getAttribute('href') || u.getAttribute('xlink:href') || '';
+      if (href.charAt(0) !== '#' || clone.querySelector(href)) return;
+      var target = doc.getElementById(href.slice(1));
+      if (!target) return;
+      var defs = clone.querySelector('defs') || clone.insertBefore(doc.createElementNS('http://www.w3.org/2000/svg', 'defs'), clone.firstChild);
+      defs.appendChild(target.cloneNode(true));
+    });
+    clone.setAttribute('width', box.width);
+    clone.setAttribute('height', box.height);
+    clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+    clone.removeAttribute('class');
+    clone.removeAttribute('style');
+    this.stats.svgs++;
+    var node = { type: 'SVG', name: this.nameFor(el), x: box.x, y: box.y, width: box.width, height: box.height, svg: new XMLSerializer().serializeToString(clone) };
+    var opacity = parseFloat(win.getComputedStyle(el).opacity);
+    if (opacity < 1) node.opacity = opacity;
+    return node;
+  };
+
+  Capturer.prototype.replacedContent = function (el, cs, box) {
+    var tag = el.tagName.toUpperCase();
+    var fit = { cover: 'FILL', contain: 'FIT', 'scale-down': 'FIT', none: 'CROP' }[cs.objectFit] || 'FILL';
+    if (tag === 'IMG') {
+      var src = el.currentSrc || el.src;
+      return src ? { paint: { type: 'IMAGE', scaleMode: fit, imageRef: this.registerImage(src) } } : {};
+    }
+    if (tag === 'VIDEO') {
+      if (el.poster) return { paint: { type: 'IMAGE', scaleMode: fit, imageRef: this.registerImage(el.poster) } };
+      return { paint: solidPaint({ r: 0.1, g: 0.1, b: 0.1, a: 1 }) };
+    }
+    if (tag === 'CANVAS') {
+      try {
+        return { paint: { type: 'IMAGE', scaleMode: 'FILL', imageRef: this.registerImage(el.toDataURL('image/png')) } };
+      } catch (e) {
+        return {};
+      }
+    }
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      var type = (el.getAttribute('type') || '').toLowerCase();
+      if (tag === 'INPUT' && !TEXT_INPUT_TYPES.has(type) && type !== 'submit' && type !== 'button') return {};
+      var text = '';
+      var placeholder = false;
+      if (tag === 'SELECT') text = el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : '';
+      else if (type === 'password' && el.value) text = el.value.replace(/./g, '•');
+      else text = el.value || '';
+      if (!text && el.placeholder) {
+        text = el.placeholder;
+        placeholder = true;
+      }
+      if (!text) return {};
+      var style = this.textStyle(cs);
+      if (placeholder && style.color) style.color = { r: style.color.r, g: style.color.g, b: style.color.b, a: style.color.a * 0.5 };
+      var left = px(cs.paddingLeft) + px(cs.borderLeftWidth);
+      var right = px(cs.paddingRight) + px(cs.borderRightWidth);
+      var top = px(cs.paddingTop) + px(cs.borderTopWidth);
+      var bottom = px(cs.paddingBottom) + px(cs.borderBottomWidth);
+      var multiline = tag === 'TEXTAREA';
+      var lh = style.lineHeight || style.fontSize * 1.2;
+      var innerH = box.height - top - bottom;
+      this.stats.texts++;
+      return {
+        text: {
+          type: 'TEXT',
+          name: text.slice(0, 40),
+          x: box.x + left,
+          y: multiline ? box.y + top : box.y + top + Math.max(0, (innerH - lh) / 2),
+          width: Math.max(1, box.width - left - right),
+          height: multiline ? innerH : lh,
+          characters: text,
+          lines: multiline ? 2 : 1,
+          clipWidth: true,
+          style: style,
+        },
+      };
+    }
+    if (tag === 'IFRAME' || tag === 'OBJECT' || tag === 'EMBED') {
+      return { paint: solidPaint({ r: 0.93, g: 0.93, b: 0.93, a: 1 }) };
+    }
+    return {};
+  };
+
+  Capturer.prototype.childNodesOf = function (el) {
+    if (el.tagName === 'SLOT' && el.assignedNodes) {
+      var assigned = el.assignedNodes({ flatten: true });
+      if (assigned.length) return assigned;
+    }
+    if (el.shadowRoot) return el.shadowRoot.childNodes;
+    return el.childNodes;
+  };
+
+  Capturer.prototype.walk = function (el, flags) {
+    flags = flags || {};
+    var tag = el.tagName.toUpperCase();
+    if (SKIP_TAGS.has(tag)) return [];
+    var cs = this.win.getComputedStyle(el);
+    if (cs.display === 'none') return [];
+    var opacity = parseFloat(cs.opacity);
+    if (opacity === 0) return [];
+    var invisible = cs.visibility === 'hidden' || cs.visibility === 'collapse';
+    var rect = el.getBoundingClientRect();
+    var box = this.box(rect);
+
+    if (tag === 'SVG') return invisible || box.width <= 0 || box.height <= 0 ? [] : [this.svgNode(el, box)];
+
+    var children = [];
+    var replaced = REPLACED_TAGS.has(tag) ? this.replacedContent(el, cs, box) : null;
+    if (replaced) {
+      if (replaced.text && !invisible) children.push(replaced.text);
+    } else {
+      var nodes = this.childNodesOf(el);
+      for (var i = 0; i < nodes.length; i++) {
+        var child = nodes[i];
+        if (child.nodeType === 1) children = children.concat(this.walk(child));
+        else if (child.nodeType === 3 && !invisible) children = children.concat(this.textNodes(child, cs));
+      }
+    }
+    sortByZ(children);
+
+    var clips = cs.overflowX !== 'visible' || cs.overflowY !== 'visible';
+    if (box.width < 0.5 || box.height < 0.5) return clips ? [] : children;
+
+    var styles = invisible ? { fills: [] } : this.frameStyles(el, cs, box, flags);
+    if (replaced && replaced.paint && !invisible) styles.fills.push(replaced.paint);
+    if (styles.borderBars && styles.borderBars.length) children = borderBarFrames(styles.borderBars, box, styles.cornerRadius).concat(children);
+
+    var frame = {
+      type: 'FRAME',
+      name: this.nameFor(el),
+      x: box.x,
+      y: box.y,
+      width: box.width,
+      height: box.height,
+      fills: styles.fills,
+      clipsContent: clips,
+      children: children,
+    };
+    ['strokes', 'strokeWeights', 'dashed', 'cornerRadius', 'effects'].forEach(function (k) {
+      if (styles[k]) frame[k] = styles[k];
+    });
+    if (opacity < 1) frame.opacity = opacity;
+    if (cs.position !== 'static' && cs.zIndex !== 'auto') frame.z = parseInt(cs.zIndex, 10) || 0;
+    this.stats.frames++;
+    return [frame];
+  };
+
+  function borderBarFrames(bars, box, radius) {
+    var r = radius || { tl: 0, tr: 0, br: 0, bl: 0 };
+    return bars.map(function (b) {
+      var w = b.width;
+      var geo = [
+        { name: 'border-top', x: box.x, y: box.y, width: box.width, height: w, cr: { tl: r.tl, tr: r.tr, br: 0, bl: 0 } },
+        { name: 'border-right', x: box.x + box.width - w, y: box.y, width: w, height: box.height, cr: { tl: 0, tr: r.tr, br: r.br, bl: 0 } },
+        { name: 'border-bottom', x: box.x, y: box.y + box.height - w, width: box.width, height: w, cr: { tl: 0, tr: 0, br: r.br, bl: r.bl } },
+        { name: 'border-left', x: box.x, y: box.y, width: w, height: box.height, cr: { tl: r.tl, tr: 0, br: 0, bl: r.bl } },
+      ][b.side];
+      var max = Math.min(geo.width, geo.height) / 2;
+      ['tl', 'tr', 'br', 'bl'].forEach(function (k) { geo.cr[k] = Math.min(geo.cr[k], max); });
+      var frame = { type: 'FRAME', name: geo.name, x: geo.x, y: geo.y, width: geo.width, height: geo.height, fills: [solidPaint(b.color)], clipsContent: false, children: [] };
+      if (geo.cr.tl || geo.cr.tr || geo.cr.br || geo.cr.bl) frame.cornerRadius = geo.cr;
+      return frame;
+    });
+  }
+
+  function sortByZ(nodes) {
+    // Stable sort: positioned elements with z-index paint above/below their siblings.
+    nodes
+      .map(function (n, i) { return { n: n, i: i }; })
+      .sort(function (a, b) { return (a.n.z || 0) - (b.n.z || 0) || a.i - b.i; })
+      .forEach(function (e, i) { nodes[i] = e.n; });
+  }
+
+  function capture(options) {
+    options = options || {};
+    var doc = options.document || global.document;
+    var win = doc.defaultView;
+    var c = new Capturer(doc, options);
+    var html = doc.documentElement;
+    var body = doc.body;
+    var root;
+
+    if (options.selector) {
+      var el = doc.querySelector(options.selector);
+      if (!el) throw new Error('No element matches selector: ' + options.selector);
+      var nodes = c.walk(el);
+      if (nodes.length === 1 && nodes[0].type === 'FRAME') root = nodes[0];
+      else {
+        var b = c.box(el.getBoundingClientRect());
+        root = { type: 'FRAME', name: c.nameFor(el), x: b.x, y: b.y, width: b.width, height: b.height, fills: [], clipsContent: false, children: nodes };
+      }
+    } else {
+      var htmlBg = parseColor(win.getComputedStyle(html).backgroundColor);
+      var bodyBg = body ? parseColor(win.getComputedStyle(body).backgroundColor) : null;
+      var width = html.clientWidth || win.innerWidth;
+      var height = Math.max(html.scrollHeight, body ? body.scrollHeight : 0, win.innerHeight);
+      root = {
+        type: 'FRAME',
+        name: doc.title || 'HTML import',
+        x: 0,
+        y: 0,
+        width: width,
+        height: height,
+        fills: [solidPaint(htmlBg || bodyBg || { r: 1, g: 1, b: 1, a: 1 })],
+        clipsContent: true,
+        // body's background propagates to the canvas when <html> has none
+        children: body ? c.walk(body, { suppressBackground: !htmlBg }) : [],
+      };
+    }
+
+    return {
+      version: VERSION,
+      generator: 'html-to-figma',
+      source: {
+        url: doc.URL,
+        title: doc.title,
+        viewport: { width: win.innerWidth, height: win.innerHeight },
+        capturedAt: new Date().toISOString(),
+      },
+      root: root,
+      images: c.images,
+      stats: c.stats,
+    };
+  }
+
+  // ---------- images (browser side) ----------
+
+  function sniffMime(bytes) {
+    if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return 'image/png';
+    if (bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg';
+    if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return 'image/gif';
+    return null;
+  }
+
+  function bytesToBase64(bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  }
+
+  function loadImage(url) {
+    return new Promise(function (resolve, reject) {
+      var img = new Image();
+      img.onload = function () { resolve(img); };
+      img.onerror = function () { reject(new Error('Could not decode image')); };
+      img.src = url;
+    });
+  }
+
+  // Figma only accepts PNG, JPEG and GIF; everything else is redrawn to PNG.
+  function blobToFigmaImage(blob) {
+    return blob.arrayBuffer().then(function (buf) {
+      var bytes = new Uint8Array(buf);
+      var mime = sniffMime(bytes);
+      if (mime && FIGMA_IMAGE_MIME.has(mime)) return { base64: bytesToBase64(bytes), mime: mime };
+      var url = URL.createObjectURL(blob);
+      return loadImage(url)
+        .then(function (img) {
+          var w = img.naturalWidth || 512;
+          var h = img.naturalHeight || 512;
+          var scale = Math.min(1, 4096 / Math.max(w, h));
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round(w * scale));
+          canvas.height = Math.max(1, Math.round(h * scale));
+          canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+          return { base64: canvas.toDataURL('image/png').split(',')[1], mime: 'image/png' };
+        })
+        .finally(function () { URL.revokeObjectURL(url); });
+    });
+  }
+
+  function convertDataUrl(dataUrl) {
+    return fetch(dataUrl).then(function (r) { return r.blob(); }).then(blobToFigmaImage);
+  }
+
+  function fetchWithTimeout(url, ms) {
+    var ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, ms);
+    return fetch(url, ctrl ? { signal: ctrl.signal } : undefined)
+      .then(function (r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.blob();
+      })
+      .finally(function () { clearTimeout(timer); });
+  }
+
+  function resolveImagesInBrowser(result, opts) {
+    opts = opts || {};
+    var timeout = opts.timeoutMs || 15000;
+    var images = result.images || {};
+    return Promise.all(
+      Object.keys(images).map(function (id) {
+        var img = images[id];
+        if (img.base64 || !img.url) return null;
+        return fetchWithTimeout(img.url, timeout)
+          .then(blobToFigmaImage)
+          .then(function (r) {
+            img.base64 = r.base64;
+            img.mime = r.mime;
+          })
+          .catch(function (e) {
+            img.error = String((e && e.message) || e);
+          });
+      })
+    ).then(function () { return result; });
+  }
+
+  global.HtmlToFigma = {
+    version: VERSION,
+    capture: capture,
+    resolveImagesInBrowser: resolveImagesInBrowser,
+    convertDataUrl: convertDataUrl,
+    // exposed for tests
+    _internals: { parseColor: parseColor, parseShadows: parseShadows, parseGradient: parseGradient, splitTopLevel: splitTopLevel },
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : window);

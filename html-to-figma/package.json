@@ -1,0 +1,19 @@
+{
+  "name": "html-to-figma",
+  "version": "0.1.0",
+  "description": "Convierte HTML/CSS y páginas web en capas editables de Figma (plugin + CLI).",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "html-to-figma": "src/cli.mjs" },
+  "files": ["src", "plugin"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "capture": "node src/cli.mjs",
+    "preview": "node scripts/preview.mjs",
+    "test": "node scripts/build.mjs && node --test tests/*.test.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.56.1"
+  }
+}

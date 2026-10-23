@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<title>Landing de prueba</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: Arial, sans-serif; background: #f4f5fb; color: #1d1f2b; }
+  nav { display: flex; justify-content: space-between; align-items: center; padding: 20px 48px; background: #fff; border-bottom: 1px solid #e3e5ef; }
+  nav .logo { font-weight: 700; font-size: 20px; letter-spacing: -0.5px; }
+  nav a { color: #4b4f66; text-decoration: none; margin-left: 24px; font-size: 14px; }
+  .hero { display: flex; gap: 48px; align-items: center; padding: 64px 48px; background: linear-gradient(135deg, #5b5bf0 0%, #9b4dff 60%, #ff6fa5 100%); color: #fff; }
+  .hero h1 { font-size: 48px; line-height: 56px; margin: 0 0 16px; max-width: 560px; }
+  .hero p { font-size: 18px; line-height: 28px; margin: 0 0 24px; max-width: 520px; opacity: 0.9; }
+  .btn { display: inline-block; padding: 14px 28px; border-radius: 999px; background: #fff; color: #5b2dd6; font-weight: 700; text-transform: uppercase; font-size: 13px; letter-spacing: 1px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18); }
+  .card { position: relative; width: 360px; padding: 24px; border-radius: 20px; background: rgba(255, 255, 255, 0.95); color: #1d1f2b; box-shadow: 0 20px 40px rgba(20, 10, 60, 0.35), inset 0 0 0 1px rgba(255,255,255,0.6); }
+  .card img { width: 100%; height: 160px; object-fit: cover; border-radius: 12px; display: block; }
+  .badge { position: absolute; top: -12px; right: -12px; z-index: 2; background: #ffcf3f; color: #3b2a00; padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; }
+  .features { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; padding: 48px; }
+  .feature { background: #fff; border: 1px solid #e3e5ef; border-left: 4px solid #5b5bf0; border-radius: 12px; padding: 24px; }
+  .feature h3 { margin: 12px 0 8px; font-size: 18px; }
+  .feature p { margin: 0; color: #5d6177; font-size: 14px; line-height: 22px; }
+  .icon { width: 40px; height: 40px; }
+  form { display: flex; gap: 12px; padding: 0 48px 48px; }
+  input { flex: 1; padding: 12px 14px; border: 1px dashed #b7bbd0; border-radius: 10px; font-size: 14px; background: #fff; }
+  button { padding: 12px 20px; border: 0; border-radius: 10px; background: #1d1f2b; color: #fff; font-size: 14px; font-weight: 700; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <nav>
+    <div class="logo">Acme<span style="color:#5b5bf0">.</span></div>
+    <div><a href="#">Producto</a><a href="#">Precios</a><a href="#">Contacto</a></div>
+  </nav>
+  <section class="hero">
+    <div>
+      <h1>Convierte tus páginas en diseños editables</h1>
+      <p>Pega HTML, captura cualquier sitio y obtén <strong>capas reales</strong> de Figma: textos, imágenes, sombras y <em>degradados</em> listos para editar.</p>
+      <span class="btn">Empezar gratis</span>
+    </div>
+    <div class="card">
+      <span class="badge">Nuevo</span>
+      <img alt="Vista previa" src="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='360' height='160'%3E%3Crect width='360' height='160' fill='%23dfe3ff'/%3E%3Ccircle cx='280' cy='40' r='60' fill='%239b4dff'/%3E%3Crect x='24' y='96' width='180' height='16' rx='8' fill='%235b5bf0'/%3E%3C/svg%3E" />
+      <h3 style="margin:16px 0 4px">Plan Pro</h3>
+      <p style="margin:0;color:#5d6177;font-size:14px">Todo lo que necesitas para tu equipo.</p>
+    </div>
+  </section>
+  <section class="features">
+    <div class="feature">
+      <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:#5b5bf0"><path d="M4 12l5 5L20 6" /></svg>
+      <h3>Texto editable</h3>
+      <p>Cada texto conserva su fuente, tamaño, color e interlineado.</p>
+    </div>
+    <div class="feature">
+      <svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" fill="#ff6fa5" /></svg>
+      <h3>Imágenes y SVG</h3>
+      <p>Las imágenes se descargan y los íconos SVG se vuelven vectores.</p>
+    </div>
+    <div class="feature">
+      <svg class="icon" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4" fill="#ffcf3f" /></svg>
+      <h3>Estilos fieles</h3>
+      <p>Bordes, esquinas, sombras y degradados se traducen a propiedades de Figma.</p>
+    </div>
+  </section>
+  <form>
+    <input placeholder="tu@correo.com" />
+    <button type="button">Suscribirme</button>
+  </form>
+  <div class="hidden">No debería aparecer</div>
+</body>
+</html>
